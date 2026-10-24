@@ -95,6 +95,59 @@ pip install mcp pywin32
 > [!NOTE]
 > Native pipe mode is **Windows only** because it uses Named Pipes (`pywin32`). Use TCP relay transport when the MCP server runs outside the Windows environment that hosts Cheat Engine and cannot open the named pipe directly.
 
+### Native Linux (Cheat Engine 7.7.1)
+
+The native Linux build can host the Lua bridge directly over TCP, without Wine
+or the Windows relay. Install Cheat Engine from the
+[official downloads page](https://www.cheatengine.org/downloads.php), then install
+the Python dependencies in a virtual environment:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r MCP_Server/requirements-tcp.txt
+```
+
+Load `MCP_Server/ce_mcp_bridge.lua` in Cheat Engine's Lua Engine. For automatic
+loading, put a Lua file containing the following in Cheat Engine's
+`autorun/custom/` directory, using your checkout's absolute path:
+
+```lua
+dofile([[/absolute/path/to/cheatengine-mcp-bridge/MCP_Server/ce_mcp_bridge.lua]])
+```
+
+On Linux the Lua bridge automatically listens on **127.0.0.1:9876**. Windows
+continues to use the named pipe by default. Set `CE_MCP_TRANSPORT=tcp` in the
+Python MCP server's environment; for example, in Codex's `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.cheatengine]
+command = "/absolute/path/to/cheatengine-mcp-bridge/.venv/bin/python"
+args = ["/absolute/path/to/cheatengine-mcp-bridge/MCP_Server/mcp_cheatengine.py"]
+
+[mcp_servers.cheatengine.env]
+CE_MCP_TRANSPORT = "tcp"
+CE_MCP_HOST = "127.0.0.1"
+CE_MCP_PORT = "9876"
+```
+
+Keep Cheat Engine running while using the tools. The Lua listener is restricted
+to loopback and serves one connected MCP client at a time. To change ports, set
+`CE_MCP_PORT` in **both Cheat Engine's and the MCP server's environments** before
+launching them. `CE_MCP_HOST` configures only the Python client.
+
+Native process access still requires the usual Linux ptrace permissions. The
+transport does not make Windows-specific APIs portable: DBK driver operations,
+Windows GUI/input calls and PE/.NET-specific helpers remain platform dependent.
+Memory reads/writes, AOB and value scans, disassembly, and ELF module enumeration
+have been exercised on native Linux. The Windows pipe path has not been runtime
+tested as part of this Linux change.
+
+To run the non-mutating TCP framing checks, disconnect other MCP clients first:
+
+```bash
+python3 MCP_Server/test_native_tcp.py
+```
+
 ---
 
 ## Quick Start

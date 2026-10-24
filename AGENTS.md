@@ -9,8 +9,14 @@ A three-tier bridge that lets AI agents (via MCP) drive Cheat Engine to inspect 
 ## Commands
 
 ```bash
-# Install Python deps (Windows only — uses pywin32)
+# Install Python deps for Windows named-pipe mode
 pip install -r MCP_Server/requirements.txt
+
+# Install deps for native Linux TCP or the Windows TCP relay
+pip install -r MCP_Server/requirements-tcp.txt
+
+# Native TCP framing tests (requires CE with bridge loaded; no attached process)
+python MCP_Server/test_native_tcp.py
 
 # Integration test suite (requires: CE running, ce_mcp_bridge.lua loaded, a process attached)
 python MCP_Server/test_mcp.py
@@ -67,7 +73,12 @@ Two files are the source of truth — there's no codegen, so you must edit both:
 
 ## Environment & safety constraints
 
-- **Windows only.** Named Pipe access via `pywin32`; no plans for cross-platform.
+- **Transport/platform:** Windows defaults to Named Pipe access via `pywin32`.
+  Native Linux CE 7.7.1 defaults to a loopback TCP listener on port 9876; configure
+  the Python client with `CE_MCP_TRANSPORT=tcp`. `CE_MCP_PORT` must match in both
+  processes. The native TCP listener serves one connected client at a time.
+  Windows-specific handlers remain platform dependent; a portable transport is
+  not a guarantee that every CE API exists on Linux.
 - **Cheat Engine prerequisite**: CE → Settings → Extra → **disable "Query memory region routines"**. With it enabled, memory scans on DBVM-protected pages trigger `CLOCK_WATCHDOG_TIMEOUT` BSODs. This is documented as a hard requirement in both `README.md` and `AI_Context/AI_Guide_MCP_Server_Implementation.md`; don't weaken the assumption without testing.
 - **Pipe name** `\\.\pipe\CE_MCP_Bridge_v99` is hardcoded in both `mcp_cheatengine.py` (as `PIPE_NAME`) and `ce_mcp_bridge.lua` (as `PIPE_NAME`). Keep them in sync if you ever rename it. The `_v99` suffix is the wire-protocol version and is independent of the bridge version (`12.0.0`).
 - **Codex config:** use TOML, not JSON. Add `[mcp_servers.cheatengine]`, `command = "python"`, and `args = ['C:\path\to\MCP_Server\mcp_cheatengine.py']`. Use TOML single-quoted strings for Windows paths so backslashes are literal, then restart Codex and verify with the `ping` tool.

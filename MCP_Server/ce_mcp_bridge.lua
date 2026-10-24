@@ -4,6 +4,20 @@
 
 local PIPE_NAME = "CE_MCP_Bridge_v99"
 local VERSION = "12.0.0"
+local TRANSPORT = os.getenv("CE_MCP_TRANSPORT") or
+    ((getOperatingSystem and getOperatingSystem() == 2) and "tcp" or "pipe")
+local TCP_PORT = tonumber(os.getenv("CE_MCP_PORT") or "9876")
+
+assert(TRANSPORT == "pipe" or TRANSPORT == "tcp", "CE_MCP_TRANSPORT must be pipe or tcp")
+if TRANSPORT == "tcp" then
+    assert(TCP_PORT and TCP_PORT % 1 == 0 and TCP_PORT >= 1 and TCP_PORT <= 65535,
+        "CE_MCP_PORT must be an integer between 1 and 65535")
+    assert(type(createSocketServer) == "function", "TCP transport requires createSocketServer (native CE 7.7.1)")
+end
+
+-- Stop the previous script instance before replacing its control functions.
+local previousWorker
+if type(StopMCPBridge) == "function" then previousWorker = StopMCPBridge() end
 
 -- Global State
 local serverState = {
@@ -11,6 +25,7 @@ local serverState = {
     timer = nil,
     pipe = nil,
     connected = false,
+    stoppingThread = previousWorker,
     scan_memscan = nil,
     scan_foundlist = nil,
     scan_is_unknown_first = false,   -- last scan_all was an "unknown initial value" first scan
@@ -5972,21 +5987,45 @@ local function executeCommand(jsonRequest)
 end
 
 -- ============================================================================
--- THREAD-BASED PIPE SERVER (NON-BLOCKING GUI)
+-- THREAD-BASED PIPE / TCP SERVER (NON-BLOCKING GUI)
 -- ============================================================================
 -- Replaces v10 Timer architecture to prevent GUI Freezes.
 -- I/O happens in Worker Thread. Execution happens in Main Thread.
 
 local function PipeWorker(thread)
     log("Worker Thread Started - Waiting for connection...")
+
+    -- Keep the TCP listener across client reconnects. The accepted sockets expose
+    -- the same LuaPipe framing API used by the Windows named-pipe transport.
+    local listener
+    if TRANSPORT == "tcp" then
+        local ok, result = pcall(createSocketServer, TCP_PORT, true) -- loopback only
+        if not ok or not result then
+            serverState.running = false
+            log("Failed to create TCP listener: " .. tostring(result))
+            return
+        end
+        listener = result
+        serverState.workerListener = listener
+    end
     
     while not thread.Terminated do
         -- Create Pipe Instance per connection attempt
         -- Increased buffer size to 256KB for better throughput
-        local pipe = createPipe(PIPE_NAME, 262144, 262144)  -- 256 KB buffers (was 64 KB)
+        local pipe
+        if listener then
+            local ok, client = pcall(function() return listener.acceptConnection(true) end)
+            if ok then pipe = client end
+        else
+            pipe = createPipe(PIPE_NAME, 262144, 262144)
+        end
         if not pipe then
-            log("Fatal: Failed to create pipe")
-            return
+            if not thread.Terminated then log("Failed to accept a bridge connection") end
+            break
+        end
+        if thread.Terminated then
+            pcall(function() pipe.destroy() end)
+            break
         end
         
         -- Store reference so we can destroy it from main thread (stopServer) to break blocking calls
@@ -6002,11 +6041,11 @@ local function PipeWorker(thread)
         -- note: acceptConnection might not return a boolean, so we check pipe.Connected afterwards.
         
         -- log("Thread: Calling acceptConnection()...")
-        pcall(function()
-            pipe.acceptConnection()
-        end)
+        if not listener then
+            pcall(function() pipe.acceptConnection() end)
+        end
         
-        if pipe.Connected and not thread.Terminated then
+        if not thread.Terminated and pipe.Connected then
             log("Client Connected")
             serverState.connected = true
             
@@ -6020,9 +6059,9 @@ local function PipeWorker(thread)
                     
                     -- Sanity check length
                     if len > 0 and len < 32 * 1024 * 1024 then
-                        local payload = pipe.readString(len)
+                        local payloadOK, payload = pcall(function() return pipe.readString(len) end)
                         
-                        if payload then
+                        if payloadOK and payload and #payload == len then
                             -- CRITICAL: EXECUTE ON MAIN THREAD
                             -- We pause the worker and run logic on GUI thread to be safe
                             local response = nil
@@ -6031,25 +6070,28 @@ local function PipeWorker(thread)
                             end)
                             
                             -- Write response back (Worker Thread)
-                            if response then
+                            if response and not thread.Terminated then
                                 local rLen = #response
                                 local b1 = rLen % 256
                                 local b2 = math.floor(rLen / 256) % 256
                                 local b3 = math.floor(rLen / 65536) % 256
                                 local b4 = math.floor(rLen / 16777216) % 256
                                 
-                                pipe.writeBytes({b1, b2, b3, b4})
-                                pipe.writeString(response)
+                                local written = pcall(function()
+                                    assert(pipe.writeBytes({b1, b2, b3, b4}) == 4)
+                                    assert(pipe.writeString(response) == rLen)
+                                end)
+                                if not written then break end
                             end
                         else
-                             -- log("Thread: Read payload failed (nil)")
+                            break
                         end
+                    else
+                        -- A bad length leaves framing ambiguous; drop this client.
+                        break
                     end
                 else
-                    -- Read failed. If pipe disconnected, the loop will terminate on next check.
-                    if not pipe.Connected then
-                        -- Client disconnected gracefully
-                    end
+                    break
                 end
             end
             
@@ -6064,11 +6106,18 @@ local function PipeWorker(thread)
         end
         
         -- Clean up pipe
-        serverState.workerPipe = nil
-        pcall(function() pipe.destroy() end)
+        if serverState.workerPipe == pipe then
+            serverState.workerPipe = nil
+            pcall(function() pipe.destroy() end)
+        end
         
         -- Brief sleep before recreating pipe to accept new connection
         if not thread.Terminated then sleep(50) end
+    end
+
+    if listener and serverState.workerListener == listener then
+        serverState.workerListener = nil
+        pcall(function() listener.destroy() end)
     end
     
     log("Worker Thread Terminated")
@@ -6085,10 +6134,19 @@ function StopMCPBridge()
         
         -- Force destroy the pipe if it's currently blocking on acceptConnection or read
         if serverState.workerPipe then
-            pcall(function() serverState.workerPipe.destroy() end)
+            local pipe = serverState.workerPipe
             serverState.workerPipe = nil
+            pcall(function() pipe.destroy() end)
+        end
+        if serverState.workerListener then
+            local listener = serverState.workerListener
+            serverState.workerListener = nil
+            pcall(function() listener.destroy() end)
         end
         
+        -- The worker may be waiting for the GUI/Lua lock, so joining it here
+        -- would deadlock. StartMCPBridge waits asynchronously before rebinding.
+        serverState.stoppingThread = serverState.workerThread
         serverState.workerThread = nil
         serverState.running = false
     end
@@ -6102,25 +6160,50 @@ function StopMCPBridge()
     cleanupZombieState()
     
     log("Server Stopped")
+    return serverState.stoppingThread
 end
 
-function StartMCPBridge()
-    StopMCPBridge()  -- This now also calls cleanupZombieState()
-    
-    -- Update Global State
-    log("Starting MCP Bridge v" .. VERSION)
-    
-    serverState.running = true
-    serverState.connected = false
-    
+local function startBridgeWorker()
+    if serverState.stoppingThread then
+        if not serverState.stoppingThread.Finished then return false end
+        serverState.stoppingThread.destroy()
+        serverState.stoppingThread = nil
+    end
+
     -- Create the Worker Thread
-    serverState.workerThread = createThread(PipeWorker)
+    serverState.workerThread = createThreadSuspended(PipeWorker)
+    serverState.workerThread.freeOnTerminate(false)
+    serverState.workerThread.resume()
     
     log("===========================================")
-    log("MCP Server Listening on: " .. PIPE_NAME)
+    log("MCP Server Listening on: " ..
+        (TRANSPORT == "tcp" and ("127.0.0.1:" .. TCP_PORT) or PIPE_NAME))
     log("Architecture: Threaded I/O + Synchronized Execution")
     log("Cleanup: Zombie Prevention Active")
     log("===========================================")
+    return true
+end
+
+function StartMCPBridge()
+    StopMCPBridge()  -- This also calls cleanupZombieState()
+    log("Starting MCP Bridge v" .. VERSION)
+    serverState.running = true
+    serverState.connected = false
+
+    if not startBridgeWorker() then
+        -- Let the old worker finish before a new socket can reuse its descriptor.
+        -- A GUI timer leaves the main thread free to service pending synchronize
+        -- calls, including the worker's final log message.
+        serverState.timer = createTimer(nil, false)
+        serverState.timer.Interval = 50
+        serverState.timer.OnTimer = function(timer)
+            if startBridgeWorker() then
+                timer.destroy()
+                serverState.timer = nil
+            end
+        end
+        serverState.timer.Enabled = true
+    end
 end
 
 -- Auto-start
